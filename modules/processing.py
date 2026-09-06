@@ -4,7 +4,7 @@ import torch
 import math
 from nodes import common_ksampler, VAEEncode, VAEDecode, VAEDecodeTiled
 from comfy_extras.nodes_custom_sampler import SamplerCustom
-from usdu_utils import pil_batch_to_tensor, tensor_to_pil, get_crop_region, expand_crop, crop_cond
+from usdu_utils import CroppedImages, pil_batch_to_tensor, tensor_to_pil, get_crop_region, expand_crop, crop_cond
 from modules import shared
 from tqdm import tqdm
 import comfy.utils as comfy_utils
@@ -749,19 +749,10 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
         else:
             image_mask = image_mask.filter(ImageFilter.GaussianBlur(p.mask_blur))
 
-    # Crop the images to get the tiles that will be used for generation
-    tiles = [img.crop(crop_region) for img in shared.batch]
-
-    # Assume the same size for all images in the batch
-    initial_tile_size = tiles[0].size
-
-    # Resize if necessary
-    for i, tile in enumerate(tiles):
-        if tile.size != tile_size:
-            tiles[i] = tile.resize(tile_size, Image.Resampling.LANCZOS)
-
-    # Encode the image / video tile
-    batched_tiles = pil_batch_to_tensor(tiles)
+    # Crop/resize/convert one frame at a time into the VAE's float tile batch.
+    # The crop operation can extend beyond the source; retain PIL's padding.
+    initial_tile_size = (crop_region[2] - crop_region[0], crop_region[3] - crop_region[1])
+    batched_tiles = pil_batch_to_tensor(CroppedImages(shared.batch, crop_region, tile_size))
 
     is_h3_startlatent_v2v = (
         getattr(p, 'use_guider', False)
@@ -778,7 +769,7 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
         (latent,) = p.vae_encoder.encode(p.vae, batched_tiles)
 
     # Sampling needs only the encoded tile, not the full temporal RGB batch.
-    del batched_tiles, tiles, tile
+    del batched_tiles
 
     if (not is_h3_startlatent_v2v) and getattr(p, 'anchor_context', False) and (
             region_mask is not None

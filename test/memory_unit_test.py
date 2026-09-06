@@ -77,6 +77,29 @@ class MemoryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             usdu_utils.pil_batch_to_tensor([Image.new("RGB", (3, 3)), Image.new("RGB", (4, 3))])
 
+    def test_lazy_crops_preserve_pixels_and_do_not_retain_tile_clip(self):
+        rng = np.random.default_rng(7)
+        images = [Image.fromarray(rng.integers(0, 256, (32, 40, 3), dtype=np.uint8))
+                  for _ in range(5)]
+        for region, size in (((2, 3, 24, 28), (22, 25)),
+                             ((-4, -3, 44, 34), (32, 32))):
+            expected = usdu_utils.pil_batch_to_tensor([
+                image.crop(region).resize(size, Image.Resampling.LANCZOS)
+                for image in images])
+            crops = usdu_utils.CroppedImages(images, region, size)
+            original = usdu_utils.pil_to_tensor
+            live = []
+
+            def one_frame(image):
+                self.assertTrue(all(ref() is None for ref in live))
+                live.append(weakref.ref(image))
+                return original(image)
+
+            with patch.object(usdu_utils, "pil_to_tensor", new=one_frame):
+                result = usdu_utils.pil_batch_to_tensor(crops)
+            self.assertTrue(torch.equal(result, expected))
+            self.assertTrue(all(ref() is None for ref in live))
+
     def test_success_releases_globals_and_preserves_input(self):
         images = torch.linspace(0, 1, 5 * 32 * 32 * 3).reshape(5, 32, 32, 3)
         snapshot = images.clone()

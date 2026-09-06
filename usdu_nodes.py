@@ -324,6 +324,12 @@ class UltimateSDUpscaleGuider:
     OUTPUT_TOOLTIPS = ("The final upscaled image.",)
     DESCRIPTION = "Upscales an image and runs image-to-image on tiles using a custom guider (e.g., PerpNegGuider, CFGGuider)."
 
+    def _prepare_images(self, image):
+        return [tensor_to_pil(image, i) for i in range(len(image))], image
+
+    def _finish_images(self, image):
+        return (pil_batch_to_tensor(shared.batch),)
+
     @release_run_buffers
     def upscale(self, image, guider, sampler, sigmas, vae, upscale_by, seed,
                 upscale_model, mode_type, tile_width, tile_height, mask_blur, tile_padding,
@@ -353,8 +359,7 @@ class UltimateSDUpscaleGuider:
         shared.actual_upscaler = upscale_model
 
         # Set the batch of images
-        shared.batch = [tensor_to_pil(image, i) for i in range(len(image))]
-        shared.batch_as_tensor = image
+        shared.batch, shared.batch_as_tensor = self._prepare_images(image)
 
         redraw_mode = MODES[mode_type]
         seam_fix_mode_enum = SEAM_FIX_MODES[seam_fix_mode]
@@ -367,7 +372,7 @@ class UltimateSDUpscaleGuider:
         if mask is not None:
             if mask.dim() == 2:
                 mask = mask.unsqueeze(0)
-            num_images = len(image)
+            num_images = len(shared.batch)
             num_masks = mask.shape[0]
             if num_masks == 1:
                 region_mask = mask_tensor_to_pil(mask, 0)
@@ -399,8 +404,8 @@ class UltimateSDUpscaleGuider:
                                    seams_fix_type=seam_fix_mode_enum, target_size_type=2,
                                    custom_width=None, custom_height=None, custom_scale=upscale_by)
 
-                # Return the resulting images
-                return (pil_batch_to_tensor(shared.batch),)
+                # Return through the transport hook while the run still owns its buffers.
+                return self._finish_images(image)
             finally:
                 # Restore progress bar (belt-and-suspenders with __del__)
                 if sdprocessing.progress_bar_enabled:

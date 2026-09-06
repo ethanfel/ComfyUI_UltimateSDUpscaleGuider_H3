@@ -122,10 +122,11 @@ def patch_usdu_upscale_method():
     def new_upscale(self):
         old_upscale(self)
         # Keep shared.batch consistent with the upscaling width/height for subsequent processing.
-        shared.batch = [self.image] + [
-            img.resize((self.p.width, self.p.height), resample=Image.LANCZOS)
-            for img in shared.batch[1:]
-        ]
+        shared.batch[0] = self.image
+        target_size = (self.p.width, self.p.height)
+        for index in range(1, len(shared.batch)):
+            if shared.batch[index].size != target_size:
+                shared.batch[index] = shared.batch[index].resize(target_size, resample=Image.LANCZOS)
 
     usdu.USDUpscaler.upscale = new_upscale
 

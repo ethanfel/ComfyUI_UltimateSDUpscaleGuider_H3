@@ -49,6 +49,24 @@ def pil_batch_to_tensor(images):
     return result
 
 
+class CroppedImages:
+    """Index a tile across the clip without retaining another PIL clip."""
+
+    def __init__(self, images, region, size):
+        self.images = images
+        self.region = region
+        self.size = size
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, index):
+        tile = self.images[index].crop(self.region)
+        if tile.size != self.size:
+            tile = tile.resize(self.size, Image.Resampling.LANCZOS)
+        return tile
+
+
 def mask_tensor_to_pil(mask_tensor, batch_index=0):
     """Convert a ComfyUI MASK tensor [B, H, W] float 0..1 to a PIL 'L' image."""
     m = torch.nan_to_num(mask_tensor[batch_index]).clamp(0.0, 1.0)

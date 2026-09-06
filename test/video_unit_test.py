@@ -66,16 +66,20 @@ class VideoTests(unittest.TestCase):
         self.assertEqual(usdu.shared.batch, [])
         self.assertIsNone(usdu.shared.batch_as_tensor)
         self.assertIsNone(usdu.shared.actual_upscaler)
+        self.assertFalse(list(self.root.glob('usdu_canvas_*')))
 
     def test_registered_schema_inherits_original(self):
         cls = pack.NODE_CLASS_MAPPINGS['UltimateSDUpscaleNoUpscaleGuiderVideo']
         self.assertIs(cls, video.UltimateSDUpscaleNoUpscaleGuiderVideo)
         native = cls.INPUT_TYPES()
         original = usdu.UltimateSDUpscaleNoUpscaleGuider.INPUT_TYPES()
-        self.assertEqual(native['optional'], original['optional'])
+        self.assertEqual({k: v for k, v in native['optional'].items()
+                          if k not in {'canvas_storage', 'canvas_directory'}}, original['optional'])
+        self.assertEqual(native['optional']['canvas_storage'][1]['default'], 'ram')
+        self.assertEqual(native['optional']['canvas_directory'][1]['default'], '')
         for name, value in original['required'].items():
             self.assertEqual(native['required']['video' if name == 'upscaled_image' else name],
-                             ('VIDEO',) if name == 'upscaled_image' else value)
+                             ('VIDEO', *value[1:]) if name == 'upscaled_image' else value)
 
     def test_no_refine_exact_pixels_clock_and_no_full_float_batch(self):
         inputs = torch.cat([frame for frame, _ in io.frames(self.source)])
@@ -84,7 +88,7 @@ class VideoTests(unittest.TestCase):
         # A full final float clip would go through this hook in the old adapter.
         with patch.dict(usdu.UltimateSDUpscaleGuider._finish_images.__globals__,
                         {'pil_batch_to_tensor': lambda *_: self.fail('Full float output clip')}):
-            output, path, count = video.UltimateSDUpscaleNoUpscaleGuiderVideo().refine(self.input, **settings())
+            output, path, count = video.UltimateSDUpscaleNoUpscaleGuiderVideo().refine(self.input, canvas_storage="disk", **settings())
         self.assertEqual(count, 5)
         actual = torch.cat([frame for frame, _ in io.frames(Path(path))])
         self.assertTrue(torch.equal(actual, expected))
@@ -97,8 +101,15 @@ class VideoTests(unittest.TestCase):
 
     def test_real_tile_loop_matches_image_path(self):
         inputs = torch.cat([frame for frame, _ in io.frames(self.source)])
-        options = settings(mode_type='Linear', tile_width=64, tile_height=64,
-                           tile_padding=0, mask_blur=3)
+        configurations = [
+            {},
+            {"tile_padding": 16},
+            {"mode_type": "Chess", "tile_overlap_mode": "Context Only Overlap"},
+            {"tile_overlap_mode": "Ignore Overlap"},
+            {"batch_size": 2},
+            {"mask": torch.linspace(0, 1, 128).expand(1, 64, 128)},
+            {"seam_fix_mode": "Half Tile"},
+        ]
         def encode(vae, images):
             return ({'samples': images.clone()},)
         def sample(guider, seed, sampler, sigmas, latent):
@@ -108,14 +119,22 @@ class VideoTests(unittest.TestCase):
         # Real tile order, crop, mask, resize and composition, deterministic VAE/sampler stand-ins.
         with patch.object(processing.VAEEncode, 'encode', side_effect=encode), \
              patch.object(processing, 'sample_with_guider', new=sample), \
+             patch.dict(usdu.usdu.Script.run.__globals__, {'sample_with_guider': sample}), \
              patch.object(processing.VAEDecode, 'decode', side_effect=decode):
-            expected = usdu.UltimateSDUpscaleNoUpscaleGuider().upscale(inputs, **options)[0]
-            output, path, count = video.UltimateSDUpscaleNoUpscaleGuiderVideo().refine(self.input, **options)
-        actual = torch.cat([frame for frame, _ in io.frames(path)])
-        self.assertTrue(torch.equal(actual, expected))
-        self.assertFalse(torch.equal(actual, inputs))
-        self.assertEqual(count, 5)
-        self.assert_clean()
+            for overrides in configurations:
+                options = settings(mode_type='Linear', tile_width=64, tile_height=64,
+                                   tile_padding=0, mask_blur=3)
+                options.update(overrides)
+                expected = usdu.UltimateSDUpscaleNoUpscaleGuider().upscale(inputs, **options)[0]
+                for storage in ('disk', 'ram'):
+                    with self.subTest(storage=storage, settings=list(overrides)):
+                        output, path, count = video.UltimateSDUpscaleNoUpscaleGuiderVideo().refine(
+                            self.input, canvas_storage=storage, **options)
+                        actual = torch.cat([frame for frame, _ in io.frames(path)])
+                        self.assertTrue(torch.equal(actual, expected))
+                        self.assertFalse(torch.equal(actual, inputs))
+                        self.assertEqual(count, 5)
+                        self.assert_clean()
 
     def test_h3_native_temporal_latent_path(self):
         from comfy_extras.nodes_minimax_h3 import _empty_av_latent
@@ -142,7 +161,7 @@ class VideoTests(unittest.TestCase):
              patch.object(processing, 'sample_with_guider', new=sample), \
              patch.object(processing.VAEDecode, 'decode', side_effect=decode):
             _, path, count = video.UltimateSDUpscaleNoUpscaleGuiderVideo().refine(
-                self.input, **settings(mode_type='Linear', vae=VAE()))
+                self.input, canvas_storage='disk', **settings(mode_type='Linear', vae=VAE()))
         self.assertEqual(calls, [(5, 64, 64, 3), (5, 64, 64, 3)])
         self.assertEqual(count, 5)
         self.assertEqual(len(list(io.timestamps(path))), 5)
@@ -154,9 +173,31 @@ class VideoTests(unittest.TestCase):
                 before = set(self.root.iterdir())
                 with patch.object(target, name, side_effect=error):
                     with self.assertRaises(type(error)):
-                        video.UltimateSDUpscaleNoUpscaleGuiderVideo().refine(self.input, **settings())
+                        video.UltimateSDUpscaleNoUpscaleGuiderVideo().refine(self.input, canvas_storage="disk", **settings())
                 self.assertEqual(set(self.root.iterdir()), before)
                 self.assert_clean()
+
+    def test_scratch_directory_only_used_in_disk_mode(self):
+        scratch = self.root / 'scratch' / 'canvas'
+        cls = video.UltimateSDUpscaleNoUpscaleGuiderVideo
+        cls().refine(self.input, canvas_directory=str(scratch), **settings())
+        self.assertFalse(scratch.exists())
+        original = cls._prepare_images
+
+        def prepare(instance, source):
+            self.assertEqual(source.canvas.directory.parent, scratch)
+            return original(instance, source)
+
+        with patch.object(cls, '_prepare_images', new=prepare):
+            cls().refine(self.input, canvas_storage='disk', canvas_directory=str(scratch), **settings())
+        self.assertEqual(list(scratch.iterdir()), [])
+        self.assert_clean()
+
+        with patch.object(video.DiskFrameCanvas, '_write', side_effect=OSError('Disk full')):
+            with self.assertRaisesRegex(OSError, 'Disk full'):
+                cls().refine(self.input, canvas_storage='disk', canvas_directory=str(scratch), **settings())
+        self.assertEqual(list(scratch.iterdir()), [])
+        self.assert_clean()
 
     def test_audio_copy(self):
         import subprocess
@@ -164,7 +205,7 @@ class VideoTests(unittest.TestCase):
         subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', str(self.source), '-f', 'lavfi', '-i',
                         'sine=frequency=440:sample_rate=8000:duration=0.208333333',
                         '-map', '0:v', '-map', '1:a', '-c:v', 'copy', '-c:a', 'pcm_s16le', str(source)], check=True)
-        output, path, _ = video.UltimateSDUpscaleNoUpscaleGuiderVideo().refine(io.from_path(source), **settings())
+        output, path, _ = video.UltimateSDUpscaleNoUpscaleGuiderVideo().refine(io.from_path(source), canvas_storage="disk", **settings())
         def audio(path):
             with av.open(str(path)) as c:
                 return np.concatenate([f.to_ndarray() for f in c.decode(audio=0)], axis=-1)

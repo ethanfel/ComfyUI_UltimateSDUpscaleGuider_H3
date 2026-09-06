@@ -1,7 +1,7 @@
 """Compare peak process RSS for IMAGE, old VIDEO adapter and native VIDEO.
 
 Set COMFYUI_ROOT and USDU_VIDEO_BENCH_DIR; run each mode in a fresh process:
-USDU_VIDEO_BENCH_MODE=make|image|legacy_video|video python -B test/benchmark_video_memory.py
+USDU_VIDEO_BENCH_MODE=make|image|legacy_video|video|video_disk python -B test/benchmark_video_memory.py
 This isolates pixel transport (mode_type=None); it does not measure model VRAM.
 """
 import gc
@@ -20,10 +20,11 @@ folder_paths.set_temp_directory(str(root))
 torch.set_num_threads(4)
 mode = os.environ['USDU_VIDEO_BENCH_MODE']
 source = root / 'source.mkv'
+frame_count = int(os.environ.get('USDU_VIDEO_BENCH_FRAMES', '22'))
 if mode == 'make':
     writer = io.RGBWriter(source, 24)
     frame = torch.linspace(0.05, 0.95, 1920).view(1, 1920, 1).expand(1088, 1920, 3)
-    for i in range(22):
+    for i in range(frame_count):
         writer.write(frame.roll(i * 13, dims=1))
     writer.close()
 else:
@@ -31,14 +32,14 @@ else:
     baseline = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     start = time.perf_counter()
     options = settings(tile_width=960, tile_height=544)
-    if mode == 'video':
-        result = video.UltimateSDUpscaleNoUpscaleGuiderVideo().refine(io.from_path(source), **options)
+    if mode in {'video', 'video_disk'}:
+        result = video.UltimateSDUpscaleNoUpscaleGuiderVideo().refine(io.from_path(source), canvas_storage='disk' if mode == 'video_disk' else 'ram', **options)
         path = result[1]
     else:
         if mode == 'image':
-            images = torch.empty((22, 1088, 1920, 3))
+            images = torch.empty((frame_count, 1088, 1920, 3))
         elif mode == 'legacy_video':
-            mapped = np.memmap(root / 'input.f32', mode='w+', dtype=np.float32, shape=(22, 1088, 1920, 3))
+            mapped = np.memmap(root / 'input.f32', mode='w+', dtype=np.float32, shape=(frame_count, 1088, 1920, 3))
             images = torch.from_numpy(mapped)
         else:
             raise ValueError(mode)
@@ -55,7 +56,7 @@ else:
     digest = hashlib.sha256()
     for frame, _ in io.frames(path):
         digest.update(frame.numpy().tobytes())
-    print(json.dumps(dict(mode=mode, baseline_rss_mib=baseline/1024,
+    print(json.dumps(dict(mode=mode, frames=frame_count, baseline_rss_mib=baseline/1024,
                          peak_rss_mib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024,
                          seconds=time.perf_counter()-start, pixel_sha256=digest.hexdigest())), flush=True)
     Path(path).unlink()

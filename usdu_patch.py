@@ -124,8 +124,10 @@ def patch_usdu_upscale_method():
         # Keep shared.batch consistent with the upscaling width/height for subsequent processing.
         shared.batch[0] = self.image
         target_size = (self.p.width, self.p.height)
+        frame_size = getattr(shared.batch, "frame_size", None)
         for index in range(1, len(shared.batch)):
-            if shared.batch[index].size != target_size:
+            size = frame_size(index) if frame_size is not None else shared.batch[index].size
+            if size != target_size:
                 shared.batch[index] = shared.batch[index].resize(target_size, resample=Image.LANCZOS)
 
     usdu.USDUpscaler.upscale = new_upscale
@@ -307,7 +309,9 @@ def _process_batch_tiles(p,
         (decoded,) = vae_decoder_tiled.decode(p.vae, samples, 512)
 
     # Composite tiles back
-    result_imgs = list(images)
+    # Retain the canvas backend; list(images) would materialize a disk-backed
+    # VIDEO scene. All tile inputs are already encoded before compositing.
+    result_imgs = images
     for i, result_img in enumerate(result_imgs):
         for j, (tx, ty) in enumerate(tiles_coords):
             idx = i * len(tiles_coords) + j

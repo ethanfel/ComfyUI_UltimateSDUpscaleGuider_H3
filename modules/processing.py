@@ -4,7 +4,7 @@ import torch
 import math
 from nodes import common_ksampler, VAEEncode, VAEDecode, VAEDecodeTiled
 from comfy_extras.nodes_custom_sampler import SamplerCustom
-from usdu_utils import pil_to_tensor, tensor_to_pil, get_crop_region, expand_crop, crop_cond
+from usdu_utils import pil_batch_to_tensor, tensor_to_pil, get_crop_region, expand_crop, crop_cond
 from modules import shared
 from tqdm import tqdm
 import comfy.utils as comfy_utils
@@ -761,7 +761,7 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
             tiles[i] = tile.resize(tile_size, Image.Resampling.LANCZOS)
 
     # Encode the image / video tile
-    batched_tiles = torch.cat([pil_to_tensor(tile) for tile in tiles], dim=0)
+    batched_tiles = pil_batch_to_tensor(tiles)
 
     is_h3_startlatent_v2v = (
         getattr(p, 'use_guider', False)
@@ -776,6 +776,9 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
         )
     else:
         (latent,) = p.vae_encoder.encode(p.vae, batched_tiles)
+
+    # Sampling needs only the encoded tile, not the full temporal RGB batch.
+    del batched_tiles, tiles, tile
 
     if (not is_h3_startlatent_v2v) and getattr(p, 'anchor_context', False) and (
             region_mask is not None
@@ -815,6 +818,8 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
             p.custom_sampler, p.custom_sigmas
         )
 
+    del latent
+
     if p.progress_bar_enabled and p.pbar is not None:
         p.pbar.update(1)
 
@@ -833,10 +838,10 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
             )
         decoded = decoded[:h3_source_frames]
 
-    # Convert the sample to a PIL image
-    tiles_sampled = [tensor_to_pil(decoded, i) for i in range(len(decoded))]
-
-    for i, tile_sampled in enumerate(tiles_sampled):
+    del samples
+    # Convert/composite one frame at a time, not another complete PIL clip.
+    for i in range(len(decoded)):
+        tile_sampled = tensor_to_pil(decoded, i)
         init_image = shared.batch[i]
         tile_mask = composite_masks[i] if composite_masks is not None else image_mask
 

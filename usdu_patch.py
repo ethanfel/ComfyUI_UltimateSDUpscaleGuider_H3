@@ -275,8 +275,9 @@ def _process_batch_tiles(p,
             batch_tile_sizes.append(tile_size)
 
     # Encode tiles -> latent
-    batched_tensors = torch.cat([usdu_utils.pil_to_tensor(tile) for tile, _ in batch_tiles], dim=0)
+    batched_tensors = usdu_utils.pil_batch_to_tensor([tile for tile, _ in batch_tiles])
     (latent,) = vae_encoder.encode(p.vae, batched_tensors)
+    del batched_tensors
 
     # Condition from first tile (assume same)
     first_tile_size = batch_tile_sizes[0]

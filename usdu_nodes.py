@@ -2,16 +2,38 @@
 
 import logging
 from contextlib import contextmanager
+from functools import wraps
+from threading import RLock
 import torch
 import comfy
 import comfy.utils as comfy_utils
 from usdu_patch import usdu
-from usdu_utils import tensor_to_pil, pil_to_tensor, mask_tensor_to_pil
+from usdu_utils import tensor_to_pil, pil_batch_to_tensor, mask_tensor_to_pil
 from modules.processing import StableDiffusionProcessing, StableDiffusionProcessingGuider, TileOverlapMode
 import modules.shared as shared
 from modules.upscaler import UpscalerData
 
 logger = logging.getLogger(__name__)
+
+
+_RUN_LOCK = RLock()
+
+
+def release_run_buffers(function):
+    """Own the A1111 globals for one call, including setup failures/cancellation."""
+    @wraps(function)
+    def run(*args, **kwargs):
+        with _RUN_LOCK:
+            progress_enabled = comfy_utils.PROGRESS_BAR_ENABLED
+            try:
+                return function(*args, **kwargs)
+            finally:
+                shared.batch = []
+                shared.batch_as_tensor = None
+                shared.actual_upscaler = None
+                shared.sd_upscalers[0] = None
+                comfy_utils.PROGRESS_BAR_ENABLED = progress_enabled
+    return run
 
 
 @contextmanager
@@ -167,6 +189,7 @@ class UltimateSDUpscale:
     OUTPUT_TOOLTIPS = ("The final upscaled image.",)
     DESCRIPTION = "Upscales an image and runs image-to-image on tiles from the input image."
 
+    @release_run_buffers
     def upscale(self, image, model, positive, negative, vae, upscale_by, seed,
                 steps, cfg, sampler_name, scheduler, denoise, upscale_model,
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
@@ -217,9 +240,7 @@ class UltimateSDUpscale:
                                    custom_width=None, custom_height=None, custom_scale=upscale_by)
 
                 # Return the resulting images
-                images = [pil_to_tensor(img) for img in shared.batch]
-                tensor = torch.cat(images, dim=0)
-                return (tensor,)
+                return (pil_batch_to_tensor(shared.batch),)
             finally:
                 # Restore progress bar (belt-and-suspenders with __del__)
                 if sdprocessing.progress_bar_enabled:
@@ -303,6 +324,7 @@ class UltimateSDUpscaleGuider:
     OUTPUT_TOOLTIPS = ("The final upscaled image.",)
     DESCRIPTION = "Upscales an image and runs image-to-image on tiles using a custom guider (e.g., PerpNegGuider, CFGGuider)."
 
+    @release_run_buffers
     def upscale(self, image, guider, sampler, sigmas, vae, upscale_by, seed,
                 upscale_model, mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
@@ -378,9 +400,7 @@ class UltimateSDUpscaleGuider:
                                    custom_width=None, custom_height=None, custom_scale=upscale_by)
 
                 # Return the resulting images
-                images = [pil_to_tensor(img) for img in shared.batch]
-                tensor = torch.cat(images, dim=0)
-                return (tensor,)
+                return (pil_batch_to_tensor(shared.batch),)
             finally:
                 # Restore progress bar (belt-and-suspenders with __del__)
                 if sdprocessing.progress_bar_enabled:

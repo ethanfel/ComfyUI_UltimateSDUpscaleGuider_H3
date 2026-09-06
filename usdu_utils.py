@@ -30,6 +30,25 @@ def pil_to_tensor(image):
     return image
 
 
+def pil_batch_to_tensor(images):
+    """Assemble one float buffer, without a second full batch for torch.cat."""
+    if not images:
+        raise ValueError("Cannot convert an empty image batch.")
+    first = pil_to_tensor(images[0])
+    result = torch.empty((len(images), *first.shape[1:]),
+                         dtype=first.dtype, device=first.device)
+    result[0:1].copy_(first)
+    expected_shape = first.shape
+    del first
+    for index in range(1, len(images)):
+        frame = pil_to_tensor(images[index])
+        if frame.shape != expected_shape:
+            raise ValueError("All images in a batch must have the same shape.")
+        result[index:index + 1].copy_(frame)
+        del frame
+    return result
+
+
 def mask_tensor_to_pil(mask_tensor, batch_index=0):
     """Convert a ComfyUI MASK tensor [B, H, W] float 0..1 to a PIL 'L' image."""
     m = torch.nan_to_num(mask_tensor[batch_index]).clamp(0.0, 1.0)

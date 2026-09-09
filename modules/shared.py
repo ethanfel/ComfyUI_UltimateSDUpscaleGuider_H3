@@ -23,3 +23,4 @@ actual_upscaler = None
 # Batch of images to upscale
 batch = []
 batch_as_tensor = None
+canvas_precision = "8-bit"

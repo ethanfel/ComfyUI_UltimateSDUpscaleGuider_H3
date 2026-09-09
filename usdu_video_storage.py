@@ -1,20 +1,25 @@
-"""Execution-scoped RGB canvas with one decoded frame resident per access."""
+"""Execution-scoped RGB canvas with bounded tile-region disk I/O."""
 
 import operator
 from pathlib import Path
 import tempfile
 
+import numpy as np
 from PIL import Image
+from usdu_canvas import (CanvasFrameReference, RGB16Frame, clipped_region, frame_from_pixels,
+                         frame_pixels, validate_precision)
 
 
 class DiskFrameCanvas:
-    """Mutable PIL frame sequence backed by raw RGB files, not a PIL clip in RAM.
+    """Mutable 8/16-bit frame sequence backed by raw RGB files.
 
     Returned images own their pixels and remain valid after the canvas closes.
     No tensor/mmap views or image cache survive an indexed read.
     """
 
-    def __init__(self, directory):
+    def __init__(self, directory, precision="8-bit"):
+        self.precision = validate_precision(precision)
+        self.dtype = np.dtype("<u2" if precision == "16-bit" else "u1")
         Path(directory).mkdir(parents=True, exist_ok=True)
         self._temporary = tempfile.TemporaryDirectory(prefix="usdu_canvas_", dir=directory)
         self.directory = Path(self._temporary.name)
@@ -47,22 +52,64 @@ class DiskFrameCanvas:
         if isinstance(index, slice):
             return [self[i] for i in range(*index.indices(len(self)))]
         index = self._index(index)
-        return Image.frombytes("RGB", self.sizes[index], self._path(index).read_bytes())
+        width, height = self.sizes[index]
+        return self.read_region(index, (0, 0, width, height))
 
     def __iter__(self):
         for index in range(len(self)):
             yield self[index]
 
     def _write(self, index, image):
-        if image.mode != "RGB":
-            raise ValueError("USDU's VIDEO canvas requires RGB frames.")
+        self._validate_frame(image)
         self._path(index).write_bytes(image.tobytes())
+
+    def _validate_frame(self, image):
+        expected = RGB16Frame if self.precision == "16-bit" else Image.Image
+        if not isinstance(image, expected) or image.mode != "RGB":
+            raise ValueError(f"USDU's VIDEO canvas requires {self.precision} RGB frames.")
 
     def __setitem__(self, index, image):
         index = self._index(index)
+        if isinstance(image, CanvasFrameReference) and image.canvas is self and image.index == index:
+            return
         self._write(index, image)
         self.sizes[index] = image.size
 
     def append(self, image):
         self._write(len(self), image)
         self.sizes.append(image.size)
+
+    def read_region(self, index, region):
+        """Read just the requested row segments, black-padding outside the frame."""
+        index = self._index(index)
+        x1, y1, x2, y2 = region
+        if x2 < x1 or y2 < y1:
+            raise ValueError("Invalid crop region.")
+        pixels = np.zeros((y2 - y1, x2 - x1, 3), dtype=self.dtype)
+        left, top, right, bottom = clipped_region(region, self.sizes[index])
+        if right > left and bottom > top:
+            width = self.sizes[index][0]
+            with self._path(index).open("rb", buffering=0) as stream:
+                for row in range(top, bottom):
+                    stream.seek(((row * width) + left) * 3 * self.dtype.itemsize)
+                    target = memoryview(pixels[row - y1, left - x1:right - x1]).cast("B")
+                    if stream.readinto(target) != len(target):
+                        raise OSError("Incomplete canvas region read.")
+        return frame_from_pixels(pixels)
+
+    def write_region(self, index, region, image):
+        """Overwrite just a tile rectangle; full-frame replacement stays explicit."""
+        index = self._index(index)
+        self._validate_frame(image)
+        x1, y1, x2, y2 = region
+        if (x2 <= x1 or y2 <= y1 or clipped_region(region, self.sizes[index]) != tuple(region)
+                or image.size != (x2 - x1, y2 - y1)):
+            raise ValueError("Canvas write region must fit the frame and match the image size.")
+        pixels = np.ascontiguousarray(frame_pixels(image), dtype=self.dtype)
+        width = self.sizes[index][0]
+        with self._path(index).open("r+b", buffering=0) as stream:
+            for row in range(y1, y2):
+                stream.seek(((row * width) + x1) * 3 * self.dtype.itemsize)
+                source = memoryview(pixels[row - y1]).cast("B")
+                if stream.write(source) != len(source):
+                    raise OSError("Incomplete canvas region write.")

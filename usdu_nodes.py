@@ -7,8 +7,10 @@ from threading import RLock
 import torch
 import comfy
 import comfy.utils as comfy_utils
+import usdu_h3
 from usdu_patch import usdu
-from usdu_utils import tensor_to_pil, pil_batch_to_tensor, mask_tensor_to_pil
+from usdu_utils import tensor_to_pil, tensor_to_frame, pil_batch_to_tensor, mask_tensor_to_pil
+from usdu_canvas import frame_reference, validate_precision
 from modules.processing import StableDiffusionProcessing, StableDiffusionProcessingGuider, TileOverlapMode
 import modules.shared as shared
 from modules.upscaler import UpscalerData
@@ -31,6 +33,7 @@ def release_run_buffers(function):
                 shared.batch = []
                 shared.batch_as_tensor = None
                 shared.actual_upscaler = None
+                shared.canvas_precision = "8-bit"
                 shared.sd_upscalers[0] = None
                 comfy_utils.PROGRESS_BAR_ENABLED = progress_enabled
     return run
@@ -131,7 +134,7 @@ def USDU_guider_base_inputs():
         ("tile_padding", ("INT", {"default": 32, "min": 0, "max": MAX_RESOLUTION, "step": 8, "tooltip": "The padding to apply between tiles."})),
         # Seam fix params
         ("seam_fix_mode", (list(SEAM_FIX_MODES.keys()), {"tooltip": "The seam fix mode to use."})),
-        ("seam_fix_denoise", ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The denoising strength to use for the seam fix."})),
+        ("seam_fix_denoise", ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Legacy compatibility control; Guider sampling uses SIGMAS. Connect seam_sigmas to set the seam pass strength. Without it, seams use the main sigmas schedule."})),
         ("seam_fix_width", ("INT", {"default": 64, "min": 0, "max": MAX_RESOLUTION, "step": 8, "tooltip": "The width of the bands used for the Band Pass seam fix mode."})),
         ("seam_fix_mask_blur", ("INT", {"default": 8, "min": 0, "max": 64, "step": 1, "tooltip": "The blur radius for the seam fix mask."})),
         ("seam_fix_padding", ("INT", {"default": 16, "min": 0, "max": MAX_RESOLUTION, "step": 8, "tooltip": "The padding to apply for the seam fix tiles."})),
@@ -144,6 +147,9 @@ def USDU_guider_base_inputs():
     optional = [
         ("mask", ("MASK", {"tooltip": "Optional region mask. Only masked (white) areas are re-diffused; tiles that do not touch the mask are skipped entirely, which greatly speeds up small-region upscales. Sampling still sees the full tile for context, and blending uses the same mask_blur feathering as tile edges (the edit extends about mask_blur pixels past the mask). The mask may be any resolution and is resized to the upscaled canvas. Grayscale values give partial blending. With batched images, a single mask applies to every image, and a batch of masks maps one mask to each image. Not compatible with batch_size > 1 (tile batching)."})),
         ("anchor_context", ("BOOLEAN", {"default": False, "tooltip": "Hold the areas a tile will not composite back to the original image at every sampling step, so the model sees the true surroundings instead of a re-diffused version that can drift. Keeps detail consistent between sections and blends seams into the real image. Takes effect when a mask is connected or tile_overlap_mode is 'Context Only Overlap'; otherwise it has no effect."})),
+        ("seam_sigmas", ("SIGMAS", {"tooltip": "Optional sampling schedule for seam repair only. Set its denoise in a separate scheduler. When absent, the seam pass uses the main sigmas input for compatibility."})),
+        ("h3_audio_lock", ("BOOLEAN", {"default": False, "tooltip": "H3 only: hold the internal empty audio latent fixed while refining video. This can change the video result. Source audio in VIDEO output is copied independently. Off preserves existing sampling behavior."})),
+        ("canvas_precision", (["8-bit", "16-bit"], {"default": "8-bit", "tooltip": "RGB canvas precision between tile passes. 16-bit reduces rounding at input, VAE decode and blending; uses twice the canvas RAM/disk space. Sampling tensor precision is unchanged."})),
     ]
 
     return required, optional
@@ -231,7 +237,7 @@ class UltimateSDUpscale:
         with suppress_logging():
             try:
                 script = usdu.Script()
-                processed = script.run(p=sdprocessing, _=None, tile_width=tile_width, tile_height=tile_height,
+                script.run(p=sdprocessing, _=None, tile_width=tile_width, tile_height=tile_height,
                                    mask_blur=mask_blur, padding=tile_padding, seams_fix_width=seam_fix_width,
                                    seams_fix_denoise=seam_fix_denoise, seams_fix_padding=seam_fix_padding,
                                    upscaler_index=0, save_upscaled_image=False, redraw_mode=redraw_mode,
@@ -325,7 +331,7 @@ class UltimateSDUpscaleGuider:
     DESCRIPTION = "Upscales an image and runs image-to-image on tiles using a custom guider (e.g., PerpNegGuider, CFGGuider)."
 
     def _prepare_images(self, image):
-        return [tensor_to_pil(image, i) for i in range(len(image))], image
+        return [tensor_to_frame(image, i, shared.canvas_precision) for i in range(len(image))], image
 
     def _finish_images(self, image):
         return (pil_batch_to_tensor(shared.batch),)
@@ -335,9 +341,28 @@ class UltimateSDUpscaleGuider:
                 upscale_model, mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
                 seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode, batch_size=1,
-                mask=None, anchor_context=False):
+                mask=None, anchor_context=False, seam_sigmas=None, h3_audio_lock=False,
+                canvas_precision="8-bit"):
+
+        shared.canvas_precision = validate_precision(canvas_precision)
 
         tile_overlap_mode_enum = TILE_OVERLAP_MODES[tile_overlap_mode]
+
+        # Validate before decoding a VIDEO or building a full PIL canvas.
+        is_h3 = usdu_h3.is_h3_guider(guider)
+        if is_h3 and batch_size != 1:
+            raise ValueError("MiniMax H3 requires batch_size=1 (one spatial tile containing the clip). "
+                             "Spatial tile batching is not supported by the H3 video model.")
+        if seam_sigmas is not None:
+            if (not isinstance(seam_sigmas, torch.Tensor) or seam_sigmas.ndim != 1
+                    or len(seam_sigmas) < 2 or not torch.isfinite(seam_sigmas).all()
+                    or (seam_sigmas < 0).any() or (seam_sigmas[1:] > seam_sigmas[:-1]).any()):
+                raise ValueError("seam_sigmas must be a finite, nonnegative, nonincreasing 1D "
+                                 "SIGMAS tensor with at least two values.")
+        sampling_enabled = mode_type != "None" or seam_fix_mode != "None"
+        anchor_active = anchor_context and (mask is not None or tile_overlap_mode_enum == TileOverlapMode.CONTEXT_ONLY)
+        if is_h3 and sampling_enabled and (anchor_active or h3_audio_lock):
+            guider = usdu_h3.prepare_masked_guider(guider)
 
         # Validate batch_size incompatibilities
         if batch_size > 1 and tile_overlap_mode_enum == TileOverlapMode.CONTEXT_ONLY:
@@ -360,6 +385,8 @@ class UltimateSDUpscaleGuider:
 
         # Set the batch of images
         shared.batch, shared.batch_as_tensor = self._prepare_images(image)
+        if is_h3 and sampling_enabled and len(shared.batch) < 5:
+            raise ValueError("MiniMax H3 video refinement requires at least 5 frames.")
 
         redraw_mode = MODES[mode_type]
         seam_fix_mode_enum = SEAM_FIX_MODES[seam_fix_mode]
@@ -374,6 +401,8 @@ class UltimateSDUpscaleGuider:
                 mask = mask.unsqueeze(0)
             num_images = len(shared.batch)
             num_masks = mask.shape[0]
+            if num_masks == 0:
+                raise ValueError("The region mask must contain at least one frame.")
             if num_masks == 1:
                 region_mask = mask_tensor_to_pil(mask, 0)
             else:
@@ -384,19 +413,21 @@ class UltimateSDUpscaleGuider:
 
         # Processing with guider
         sdprocessing = StableDiffusionProcessingGuider(
-            shared.batch[0], guider, sampler, sigmas, vae,
+            frame_reference(shared.batch, 0), guider, sampler, sigmas, vae,
             seed, upscale_by, tile_overlap_mode_enum, tiled_decode,
             tile_width, tile_height, redraw_mode, seam_fix_mode_enum,
             batch_size,
             region_mask=region_mask,
             anchor_context=anchor_context,
+            seam_sigmas=seam_sigmas,
+            h3_audio_lock=h3_audio_lock,
         )
 
         # Suppress logging to prevent duplicate tqdm progress bars
         with suppress_logging():
             try:
                 script = usdu.Script()
-                processed = script.run(p=sdprocessing, _=None, tile_width=tile_width, tile_height=tile_height,
+                script.run(p=sdprocessing, _=None, tile_width=tile_width, tile_height=tile_height,
                                    mask_blur=mask_blur, padding=tile_padding, seams_fix_width=seam_fix_width,
                                    seams_fix_denoise=seam_fix_denoise, seams_fix_padding=seam_fix_padding,
                                    upscaler_index=0, save_upscaled_image=False, redraw_mode=redraw_mode,
@@ -434,13 +465,16 @@ class UltimateSDUpscaleNoUpscaleGuider(UltimateSDUpscaleGuider):
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
                 seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode, batch_size=1,
-                mask=None, anchor_context=False):
+                mask=None, anchor_context=False, seam_sigmas=None, h3_audio_lock=False,
+                canvas_precision="8-bit"):
         upscale_by = 1.0
         return super().upscale(upscaled_image, guider, sampler, sigmas, vae, upscale_by, seed,
                                None, mode_type, tile_width, tile_height, mask_blur, tile_padding,
                                seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
                                seam_fix_width, seam_fix_padding, tile_overlap_mode, tiled_decode, batch_size,
-                               mask=mask, anchor_context=anchor_context)
+                               mask=mask, anchor_context=anchor_context,
+                               seam_sigmas=seam_sigmas, h3_audio_lock=h3_audio_lock,
+                               canvas_precision=canvas_precision)
 
 
 # A dictionary that contains all nodes you want to export with their names

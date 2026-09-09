@@ -50,6 +50,7 @@ class MemoryTests(unittest.TestCase):
         self.assertIsNone(shared.batch_as_tensor)
         self.assertIsNone(shared.actual_upscaler)
         self.assertIsNone(shared.sd_upscalers[0])
+        self.assertEqual(shared.canvas_precision, "8-bit")
 
     def test_exact_preallocated_conversion(self):
         rng = np.random.default_rng(7)
@@ -76,6 +77,12 @@ class MemoryTests(unittest.TestCase):
             usdu_utils.pil_batch_to_tensor([])
         with self.assertRaises(ValueError):
             usdu_utils.pil_batch_to_tensor([Image.new("RGB", (3, 3)), Image.new("RGB", (4, 3))])
+
+    def test_pixel_conversion_clamps_without_changing_valid_values(self):
+        values = torch.tensor([-0.1, 0., 0.5, 1., 1.1, float('nan'), float('inf'), -float('inf')])
+        image = values.view(1, 1, -1, 1).expand(-1, -1, -1, 3)
+        converted = np.array(usdu_utils.tensor_to_pil(image))
+        self.assertEqual(converted[0, :, 0].tolist(), [0, 0, 127, 255, 255, 0, 255, 0])
 
     def test_lazy_crops_preserve_pixels_and_do_not_retain_tile_clip(self):
         rng = np.random.default_rng(7)
@@ -117,14 +124,14 @@ class MemoryTests(unittest.TestCase):
 
     def test_cleanup_after_setup_sampling_and_cancellation_failures(self):
         images = torch.zeros(5, 32, 32, 3)
-        for target, name in ((usdu_nodes, "tensor_to_pil"),
+        for target, name in ((usdu_nodes, "tensor_to_frame"),
                              (usdu_nodes, "StableDiffusionProcessingGuider"),
                              (usdu_nodes.usdu.Script, "run")):
             for exception in (RuntimeError("test"), KeyboardInterrupt()):
                 enabled = comfy.utils.PROGRESS_BAR_ENABLED
                 with patch.object(target, name, side_effect=exception):
                     with self.assertRaises(type(exception)):
-                        run_node(images)
+                        run_node(images, canvas_precision="16-bit")
                 self.assert_clean()
                 self.assertEqual(comfy.utils.PROGRESS_BAR_ENABLED, enabled)
 

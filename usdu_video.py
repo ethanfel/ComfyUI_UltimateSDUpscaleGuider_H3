@@ -8,7 +8,8 @@ from pathlib import Path
 from . import usdu_video_io as video_io
 from .usdu_nodes import UltimateSDUpscaleNoUpscaleGuider, shared
 from .usdu_video_storage import DiskFrameCanvas
-from usdu_utils import pil_to_tensor, tensor_to_pil
+from usdu_utils import pil_to_tensor, tensor_to_frame
+from usdu_canvas import validate_precision
 
 
 @dataclass
@@ -27,14 +28,19 @@ class UltimateSDUpscaleNoUpscaleGuiderVideo(UltimateSDUpscaleNoUpscaleGuider):
             "video" if key == "upscaled_image" else key: ("VIDEO", *value[1:]) if key == "upscaled_image" else value
             for key, value in schema["required"].items()
         }
+        # Append new widgets after this node's existing storage widgets so saved
+        # positional widget values still map to the same controls.
+        new_controls = {name: schema["optional"].pop(name)
+                        for name in ("h3_audio_lock", "canvas_precision")}
         schema.setdefault("optional", {})["canvas_storage"] = (["ram", "disk"], {
             "default": "ram",
-            "tooltip": "Disk keeps the full RGB canvas in temporary files to reduce RAM use. RAM keeps PIL frames in memory. Sampling and pixels are identical; use fast local scratch storage for disk mode.",
+            "tooltip": "Disk keeps RGB frames in temporary files and reads/writes tile regions. RAM keeps frames in memory. Sampling and pixels are identical at the same canvas precision; use fast local scratch storage for disk mode.",
         })
         schema["optional"]["canvas_directory"] = ("STRING", {
             "default": "",
             "tooltip": "Disk mode only: scratch folder on a local SSD. Empty uses ComfyUI's temp folder. Avoid RAM-backed folders (tmpfs) to reduce system RAM use. Temporary canvas files are removed after execution.",
         })
+        schema["optional"].update(new_controls)
         return schema
 
     RETURN_TYPES = ("VIDEO", "STRING", "INT")
@@ -52,9 +58,10 @@ class UltimateSDUpscaleNoUpscaleGuiderVideo(UltimateSDUpscaleNoUpscaleGuider):
 
         if canvas_storage not in {"disk", "ram"}:
             raise ValueError("canvas_storage must be disk or ram.")
+        precision = validate_precision(kwargs.get("canvas_precision", "8-bit"))
         path = video_io.source_path(video)
         info = video_io.probe(path)
-        canvas = (DiskFrameCanvas(Path(canvas_directory).expanduser() if canvas_directory else folder_paths.get_temp_directory())
+        canvas = (DiskFrameCanvas(Path(canvas_directory).expanduser() if canvas_directory else folder_paths.get_temp_directory(), precision)
                   if canvas_storage == "disk" else nullcontext([]))
         with canvas as frames:
             source = VideoSource(path, info, frames)
@@ -66,8 +73,7 @@ class UltimateSDUpscaleNoUpscaleGuiderVideo(UltimateSDUpscaleNoUpscaleGuider):
         for frame, timestamp in video_io.frames(source.path):
             if tuple(frame.shape[1:]) != expected:
                 raise ValueError("Video dimensions change within the scene.")
-            # Keep the original USDU float -> uint8 conversion exactly.
-            images.append(tensor_to_pil(frame))
+            images.append(tensor_to_frame(frame, precision=shared.canvas_precision))
             source.timestamps.append(timestamp)
         if not images:
             raise ValueError("The video contains no frames.")

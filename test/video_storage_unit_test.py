@@ -3,6 +3,7 @@ import gc
 import importlib.util
 from pathlib import Path
 import tempfile
+import sys
 import unittest
 import weakref
 
@@ -10,6 +11,7 @@ import numpy as np
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 spec = importlib.util.spec_from_file_location('usdu_video_storage_test', ROOT / 'usdu_video_storage.py')
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)

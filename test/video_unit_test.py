@@ -3,6 +3,7 @@
 COMFYUI_ROOT=/path/to/ComfyUI python -B test/video_unit_test.py
 """
 import importlib.util
+from itertools import product
 import os
 from pathlib import Path
 import sys
@@ -66,6 +67,7 @@ class VideoTests(unittest.TestCase):
         self.assertEqual(usdu.shared.batch, [])
         self.assertIsNone(usdu.shared.batch_as_tensor)
         self.assertIsNone(usdu.shared.actual_upscaler)
+        self.assertEqual(usdu.shared.canvas_precision, '8-bit')
         self.assertFalse(list(self.root.glob('usdu_canvas_*')))
 
     def test_registered_schema_inherits_original(self):
@@ -77,6 +79,9 @@ class VideoTests(unittest.TestCase):
                           if k not in {'canvas_storage', 'canvas_directory'}}, original['optional'])
         self.assertEqual(native['optional']['canvas_storage'][1]['default'], 'ram')
         self.assertEqual(native['optional']['canvas_directory'][1]['default'], '')
+        self.assertEqual(native['optional']['canvas_precision'][1]['default'], '8-bit')
+        self.assertEqual(list(native['optional'])[-4:],
+                         ['canvas_storage', 'canvas_directory', 'h3_audio_lock', 'canvas_precision'])
         for name, value in original['required'].items():
             self.assertEqual(native['required']['video' if name == 'upscaled_image' else name],
                              ('VIDEO', *value[1:]) if name == 'upscaled_image' else value)
@@ -107,8 +112,11 @@ class VideoTests(unittest.TestCase):
             {"mode_type": "Chess", "tile_overlap_mode": "Context Only Overlap"},
             {"tile_overlap_mode": "Ignore Overlap"},
             {"batch_size": 2},
+            {"batch_size": 2, "mode_type": "Chess"},
             {"mask": torch.linspace(0, 1, 128).expand(1, 64, 128)},
             {"seam_fix_mode": "Half Tile"},
+            {"seam_fix_mode": "Band Pass", "seam_fix_width": 16},
+            {"seam_fix_mode": "Half Tile + Intersections"},
         ]
         def encode(vae, images):
             return ({'samples': images.clone()},)
@@ -116,18 +124,25 @@ class VideoTests(unittest.TestCase):
             return {'samples': 1 - latent['samples']}
         def decode(vae, samples):
             return (samples['samples'],)
+        original_run = usdu.usdu.Script.run
+
+        def region_only_run(*args, **kwargs):
+            with patch.object(video.DiskFrameCanvas, '__getitem__', side_effect=AssertionError('Full canvas read in tile loop')), \
+                    patch.object(video.DiskFrameCanvas, '_write', side_effect=AssertionError('Full canvas write in tile loop')):
+                return original_run(*args, **kwargs)
         # Real tile order, crop, mask, resize and composition, deterministic VAE/sampler stand-ins.
         with patch.object(processing.VAEEncode, 'encode', side_effect=encode), \
              patch.object(processing, 'sample_with_guider', new=sample), \
              patch.dict(usdu.usdu.Script.run.__globals__, {'sample_with_guider': sample}), \
+             patch.object(usdu.usdu.Script, 'run', new=region_only_run), \
              patch.object(processing.VAEDecode, 'decode', side_effect=decode):
-            for overrides in configurations:
+            for precision, overrides in product(('8-bit', '16-bit'), configurations):
                 options = settings(mode_type='Linear', tile_width=64, tile_height=64,
-                                   tile_padding=0, mask_blur=3)
+                                   tile_padding=0, mask_blur=3, canvas_precision=precision)
                 options.update(overrides)
                 expected = usdu.UltimateSDUpscaleNoUpscaleGuider().upscale(inputs, **options)[0]
                 for storage in ('disk', 'ram'):
-                    with self.subTest(storage=storage, settings=list(overrides)):
+                    with self.subTest(storage=storage, precision=precision, settings=list(overrides)):
                         output, path, count = video.UltimateSDUpscaleNoUpscaleGuiderVideo().refine(
                             self.input, canvas_storage=storage, **options)
                         actual = torch.cat([frame for frame, _ in io.frames(path)])
@@ -135,6 +150,25 @@ class VideoTests(unittest.TestCase):
                         self.assertFalse(torch.equal(actual, inputs))
                         self.assertEqual(count, 5)
                         self.assert_clean()
+
+    def test_uint16_transport_preserves_all_source_levels(self):
+        inputs = torch.cat([frame for frame, _ in io.frames(self.source)])
+        image = usdu.UltimateSDUpscaleNoUpscaleGuider().upscale(inputs, **settings(canvas_precision='16-bit'))[0]
+        self.assertTrue(torch.equal(image, inputs))
+        self.assertGreater(len(torch.unique(image)), 256)
+        for storage in ('ram', 'disk'):
+            _, path, _ = video.UltimateSDUpscaleNoUpscaleGuiderVideo().refine(
+                self.input, canvas_storage=storage, **settings(canvas_precision='16-bit'))
+            actual = torch.cat([frame for frame, _ in io.frames(path)])
+            self.assertTrue(torch.equal(actual, inputs))
+            self.assertEqual(list(io.timestamps(self.source)), list(io.timestamps(path)))
+            self.assert_clean()
+
+    def test_rejects_invalid_precision_before_video_decode(self):
+        with patch.object(io, 'frames', side_effect=AssertionError('Decoded source')):
+            with self.assertRaisesRegex(ValueError, 'canvas_precision'):
+                video.UltimateSDUpscaleNoUpscaleGuiderVideo().refine(self.input, **settings(canvas_precision='float'))
+        self.assert_clean()
 
     def test_h3_native_temporal_latent_path(self):
         from comfy_extras.nodes_minimax_h3 import _empty_av_latent

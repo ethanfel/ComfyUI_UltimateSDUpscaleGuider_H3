@@ -17,13 +17,13 @@ import math
 from typing import Tuple, List
 
 from PIL import Image, ImageFilter, ImageDraw
-import torch
 from tqdm import tqdm
 
 from comfy_extras.nodes_custom_sampler import SamplerCustom
 from nodes import common_ksampler, VAEEncode, VAEDecode, VAEDecodeTiled
 
 import modules.shared as shared
+from usdu_canvas import composite_tile, frame_reference
 from modules.processing import sample_with_guider
 from repositories import ultimate_upscale as usdu
 import usdu_utils
@@ -81,8 +81,14 @@ def patch_usdu_upscaler_init():
 
     @wraps(old_init)
     def new_init(self, p, image, upscaler_index, save_redraw, save_seams_fix, tile_width, tile_height):
-        p.width = round_length(image.width * p.upscale_by)
-        p.height = round_length(image.height * p.upscale_by)
+        if usdu.processing._usdu_h3_startlatent_is_h3_guider(getattr(p, "guider", None)):
+            # H3 aligns its processing tiles with padding; the output canvas
+            # need not be rounded or resized to the latent grid.
+            p.width = max(1, round(image.width * p.upscale_by))
+            p.height = max(1, round(image.height * p.upscale_by))
+        else:
+            p.width = round_length(image.width * p.upscale_by)
+            p.height = round_length(image.height * p.upscale_by)
         return old_init(self, p, image, upscaler_index, save_redraw, save_seams_fix, tile_width, tile_height)
 
     usdu.USDUpscaler.__init__ = new_init
@@ -123,6 +129,7 @@ def patch_usdu_upscale_method():
         old_upscale(self)
         # Keep shared.batch consistent with the upscaling width/height for subsequent processing.
         shared.batch[0] = self.image
+        self.image = frame_reference(shared.batch, 0)
         target_size = (self.p.width, self.p.height)
         frame_size = getattr(shared.batch, "frame_size", None)
         for index in range(1, len(shared.batch)):
@@ -133,11 +140,30 @@ def patch_usdu_upscale_method():
     usdu.USDUpscaler.upscale = new_upscale
 
 
+def patch_usdu_seam_schedule():
+    old_start = usdu.USDUSeamsFix.start
+
+    @wraps(old_start)
+    def start(self, p, image, rows, cols):
+        seam_sigmas = getattr(p, "seam_sigmas", None)
+        if not getattr(p, "use_guider", False) or seam_sigmas is None:
+            return old_start(self, p, image, rows, cols)
+        redraw_sigmas = p.sigmas
+        try:
+            p.sigmas = seam_sigmas
+            return old_start(self, p, image, rows, cols)
+        finally:
+            p.sigmas = redraw_sigmas
+
+    usdu.USDUSeamsFix.start = start
+
+
 # Apply patches
 patch_usdu_upscaler_init()
 patch_usdu_redraw_init()
 patch_usdu_seams_fix_init()
 patch_usdu_upscale_method()
+patch_usdu_seam_schedule()
 
 
 # -------------------------
@@ -269,7 +295,8 @@ def _process_batch_tiles(p,
     batch_crop_regions = []
     batch_tile_sizes = []
 
-    for image in images:
+    for index in range(len(images)):
+        image = frame_reference(images, index)
         for tx, ty in tiles_coords:
             cropped_tile, initial_tile_size, tile_mask, crop_region, tile_size = _prepare_tile_for_batch(calc_rectangle_fn, image, tx, ty, p)
             batch_tiles.append((cropped_tile, initial_tile_size))
@@ -312,10 +339,10 @@ def _process_batch_tiles(p,
     # Retain the canvas backend; list(images) would materialize a disk-backed
     # VIDEO scene. All tile inputs are already encoded before compositing.
     result_imgs = images
-    for i, result_img in enumerate(result_imgs):
+    for i in range(len(result_imgs)):
         for j, (tx, ty) in enumerate(tiles_coords):
             idx = i * len(tiles_coords) + j
-            tile_sampled = usdu_utils.tensor_to_pil(decoded, idx)
+            tile_sampled = usdu_utils.tensor_to_frame(decoded, idx, shared.canvas_precision)
             initial_tile_size = batch_tiles[idx][1]
             crop_region = batch_crop_regions[idx]
             tile_mask = batch_masks[idx]
@@ -323,18 +350,7 @@ def _process_batch_tiles(p,
             if tile_sampled.size != initial_tile_size:
                 tile_sampled = tile_sampled.resize(initial_tile_size, Image.Resampling.LANCZOS)
 
-            image_tile_only = Image.new('RGBA', result_img.size)
-            image_tile_only.paste(tile_sampled, crop_region[:2])
-
-            # Add mask as alpha and composite
-            temp = image_tile_only.copy()
-            temp.putalpha(tile_mask)
-            image_tile_only.paste(temp, image_tile_only)
-
-            result = result_img.convert('RGBA')
-            result.alpha_composite(image_tile_only)
-            result_img = result.convert('RGB')
-            result_imgs[i] = result_img
+            composite_tile(result_imgs, i, tile_sampled, crop_region, tile_mask)
 
     return result_imgs
 

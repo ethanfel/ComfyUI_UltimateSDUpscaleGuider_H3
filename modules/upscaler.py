@@ -1,5 +1,5 @@
 from PIL import Image
-from usdu_utils import tensor_to_frame
+from usdu_utils import tensor_to_pil
 from comfy_extras.nodes_upscale_model import ImageUpscaleWithModel
 from modules import shared
 
@@ -19,7 +19,7 @@ class Upscaler:
             (upscaled,) = ImageUpscaleWithModel.execute(shared.actual_upscaler, shared.batch_as_tensor)
         else:
             (upscaled,) = ImageUpscaleWithModel().upscale(shared.actual_upscaler, shared.batch_as_tensor)
-        shared.batch = [tensor_to_frame(upscaled, i, shared.canvas_precision) for i in range(len(upscaled))]
+        shared.batch = [tensor_to_pil(upscaled, i) for i in range(len(upscaled))]
         return shared.batch[0]
 
 

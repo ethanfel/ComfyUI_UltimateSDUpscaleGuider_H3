@@ -4,7 +4,7 @@ import torch
 import math
 from nodes import common_ksampler, VAEEncode, VAEDecode, VAEDecodeTiled
 from comfy_extras.nodes_custom_sampler import SamplerCustom
-from usdu_utils import CroppedImages, pil_batch_to_tensor, tensor_to_frame, get_crop_region, expand_crop, crop_cond
+from usdu_utils import CroppedImages, pil_batch_to_tensor, tensor_to_pil, get_crop_region, expand_crop, crop_cond
 from usdu_canvas import composite_tile, frame_reference
 from modules import shared
 from tqdm import tqdm
@@ -274,8 +274,6 @@ class StableDiffusionProcessingGuider:
         batch_size=1,
         region_mask=None,
         anchor_context=False,
-        seam_sigmas=None,
-        h3_audio_lock=False,
     ):
         # Variables used by the USDU script
         self.init_images = [init_img]
@@ -328,8 +326,6 @@ class StableDiffusionProcessingGuider:
         self._region_mask_cache = {}
         # Optional inpaint-style anchoring of non-composited tile areas
         self.anchor_context = anchor_context
-        self.seam_sigmas = seam_sigmas
-        self.h3_audio_lock = h3_audio_lock
         self.vae_decoder = VAEDecode()
         self.vae_encoder = VAEEncode()
         self.vae_decoder_tiled = VAEDecodeTiled()
@@ -762,10 +758,10 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
     anchor_active = getattr(p, 'anchor_context', False) and (
             region_mask is not None
             or p.tile_overlap_mode == TileOverlapMode.CONTEXT_ONLY)
-    if is_h3_startlatent_v2v and (anchor_active or getattr(p, 'h3_audio_lock', False)):
-        anchor_masks = (composite_masks if composite_masks is not None else [image_mask]) if anchor_active else None
+    if is_h3_startlatent_v2v and anchor_active:
+        anchor_masks = composite_masks if composite_masks is not None else [image_mask]
         latent["noise_mask"] = usdu_h3.build_noise_mask(
-            latent["samples"], lock_audio=getattr(p, 'h3_audio_lock', False),
+            latent["samples"],
             masks=anchor_masks, source_frames=h3_source_frames,
             crop_region=crop_region, tile_size=tile_size)
     elif anchor_active:
@@ -827,7 +823,7 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
     del samples
     # Convert/composite one frame at a time, not another complete PIL clip.
     for i in range(len(decoded)):
-        tile_sampled = tensor_to_frame(decoded, i, shared.canvas_precision)
+        tile_sampled = tensor_to_pil(decoded, i)
         if padded_tile_size != tile_size:
             tile_sampled = tile_sampled.crop((0, 0, *tile_size))
         tile_mask = composite_masks[i] if composite_masks is not None else image_mask

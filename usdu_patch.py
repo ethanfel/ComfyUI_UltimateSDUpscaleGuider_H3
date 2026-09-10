@@ -140,30 +140,11 @@ def patch_usdu_upscale_method():
     usdu.USDUpscaler.upscale = new_upscale
 
 
-def patch_usdu_seam_schedule():
-    old_start = usdu.USDUSeamsFix.start
-
-    @wraps(old_start)
-    def start(self, p, image, rows, cols):
-        seam_sigmas = getattr(p, "seam_sigmas", None)
-        if not getattr(p, "use_guider", False) or seam_sigmas is None:
-            return old_start(self, p, image, rows, cols)
-        redraw_sigmas = p.sigmas
-        try:
-            p.sigmas = seam_sigmas
-            return old_start(self, p, image, rows, cols)
-        finally:
-            p.sigmas = redraw_sigmas
-
-    usdu.USDUSeamsFix.start = start
-
-
 # Apply patches
 patch_usdu_upscaler_init()
 patch_usdu_redraw_init()
 patch_usdu_seams_fix_init()
 patch_usdu_upscale_method()
-patch_usdu_seam_schedule()
 
 
 # -------------------------
@@ -342,7 +323,7 @@ def _process_batch_tiles(p,
     for i in range(len(result_imgs)):
         for j, (tx, ty) in enumerate(tiles_coords):
             idx = i * len(tiles_coords) + j
-            tile_sampled = usdu_utils.tensor_to_frame(decoded, idx, shared.canvas_precision)
+            tile_sampled = usdu_utils.tensor_to_pil(decoded, idx)
             initial_tile_size = batch_tiles[idx][1]
             crop_region = batch_crop_regions[idx]
             tile_mask = batch_masks[idx]

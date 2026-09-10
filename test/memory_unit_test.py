@@ -50,7 +50,6 @@ class MemoryTests(unittest.TestCase):
         self.assertIsNone(shared.batch_as_tensor)
         self.assertIsNone(shared.actual_upscaler)
         self.assertIsNone(shared.sd_upscalers[0])
-        self.assertEqual(shared.canvas_precision, "8-bit")
 
     def test_exact_preallocated_conversion(self):
         rng = np.random.default_rng(7)
@@ -124,14 +123,14 @@ class MemoryTests(unittest.TestCase):
 
     def test_cleanup_after_setup_sampling_and_cancellation_failures(self):
         images = torch.zeros(5, 32, 32, 3)
-        for target, name in ((usdu_nodes, "tensor_to_frame"),
+        for target, name in ((usdu_nodes, "tensor_to_pil"),
                              (usdu_nodes, "StableDiffusionProcessingGuider"),
                              (usdu_nodes.usdu.Script, "run")):
             for exception in (RuntimeError("test"), KeyboardInterrupt()):
                 enabled = comfy.utils.PROGRESS_BAR_ENABLED
                 with patch.object(target, name, side_effect=exception):
                     with self.assertRaises(type(exception)):
-                        run_node(images, canvas_precision="16-bit")
+                        run_node(images)
                 self.assert_clean()
                 self.assertEqual(comfy.utils.PROGRESS_BAR_ENABLED, enabled)
 

@@ -24,7 +24,7 @@ def aligned_size(size):
     return tuple(((int(edge) + 31) // 32) * 32 for edge in size)
 
 
-def build_noise_mask(samples, *, lock_audio=False, masks=None,
+def build_noise_mask(samples, *, masks=None,
                      source_frames=None, crop_region=None, tile_size=None):
     """Map pixel edit masks to H3's temporal tokens and 32px spatial patches.
 
@@ -60,7 +60,7 @@ def build_noise_mask(samples, *, lock_audio=False, masks=None,
             token_rows.append(row[0, 0])
             frame_start += count
         video_mask.copy_(torch.stack(token_rows, dim=0).to(video_mask)[None, None])
-    audio_mask = torch.zeros_like(audio) if lock_audio else torch.ones_like(audio)
+    audio_mask = torch.ones_like(audio)
     return NestedTensor((video_mask, audio_mask))
 
 

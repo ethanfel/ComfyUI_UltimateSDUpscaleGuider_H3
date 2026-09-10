@@ -6,20 +6,17 @@ import tempfile
 
 import numpy as np
 from PIL import Image
-from usdu_canvas import (CanvasFrameReference, RGB16Frame, clipped_region, frame_from_pixels,
-                         frame_pixels, validate_precision)
+from usdu_canvas import CanvasFrameReference, clipped_region
 
 
 class DiskFrameCanvas:
-    """Mutable 8/16-bit frame sequence backed by raw RGB files.
+    """Mutable frame sequence backed by raw 8-bit RGB files.
 
     Returned images own their pixels and remain valid after the canvas closes.
     No tensor/mmap views or image cache survive an indexed read.
     """
 
-    def __init__(self, directory, precision="8-bit"):
-        self.precision = validate_precision(precision)
-        self.dtype = np.dtype("<u2" if precision == "16-bit" else "u1")
+    def __init__(self, directory):
         Path(directory).mkdir(parents=True, exist_ok=True)
         self._temporary = tempfile.TemporaryDirectory(prefix="usdu_canvas_", dir=directory)
         self.directory = Path(self._temporary.name)
@@ -64,9 +61,8 @@ class DiskFrameCanvas:
         self._path(index).write_bytes(image.tobytes())
 
     def _validate_frame(self, image):
-        expected = RGB16Frame if self.precision == "16-bit" else Image.Image
-        if not isinstance(image, expected) or image.mode != "RGB":
-            raise ValueError(f"USDU's VIDEO canvas requires {self.precision} RGB frames.")
+        if not isinstance(image, Image.Image) or image.mode != "RGB":
+            raise ValueError("USDU's VIDEO canvas requires 8-bit RGB frames.")
 
     def __setitem__(self, index, image):
         index = self._index(index)
@@ -85,17 +81,17 @@ class DiskFrameCanvas:
         x1, y1, x2, y2 = region
         if x2 < x1 or y2 < y1:
             raise ValueError("Invalid crop region.")
-        pixels = np.zeros((y2 - y1, x2 - x1, 3), dtype=self.dtype)
+        pixels = np.zeros((y2 - y1, x2 - x1, 3), dtype=np.uint8)
         left, top, right, bottom = clipped_region(region, self.sizes[index])
         if right > left and bottom > top:
             width = self.sizes[index][0]
             with self._path(index).open("rb", buffering=0) as stream:
                 for row in range(top, bottom):
-                    stream.seek(((row * width) + left) * 3 * self.dtype.itemsize)
+                    stream.seek(((row * width) + left) * 3)
                     target = memoryview(pixels[row - y1, left - x1:right - x1]).cast("B")
                     if stream.readinto(target) != len(target):
                         raise OSError("Incomplete canvas region read.")
-        return frame_from_pixels(pixels)
+        return Image.fromarray(pixels)
 
     def write_region(self, index, region, image):
         """Overwrite just a tile rectangle; full-frame replacement stays explicit."""
@@ -105,11 +101,11 @@ class DiskFrameCanvas:
         if (x2 <= x1 or y2 <= y1 or clipped_region(region, self.sizes[index]) != tuple(region)
                 or image.size != (x2 - x1, y2 - y1)):
             raise ValueError("Canvas write region must fit the frame and match the image size.")
-        pixels = np.ascontiguousarray(frame_pixels(image), dtype=self.dtype)
+        pixels = np.ascontiguousarray(image, dtype=np.uint8)
         width = self.sizes[index][0]
         with self._path(index).open("r+b", buffering=0) as stream:
             for row in range(y1, y2):
-                stream.seek(((row * width) + x1) * 3 * self.dtype.itemsize)
+                stream.seek(((row * width) + x1) * 3)
                 source = memoryview(pixels[row - y1]).cast("B")
                 if stream.write(source) != len(source):
                     raise OSError("Incomplete canvas region write.")

@@ -3,7 +3,7 @@ from PIL import Image, ImageFilter
 import torch
 import torch.nn.functional as F
 import math
-from usdu_canvas import RGB16Frame, frame_pixels, frame_from_pixels, frame_reference, validate_precision
+from usdu_canvas import frame_reference
 
 # Compatibility for older Pillow versions
 try:
@@ -21,19 +21,9 @@ def tensor_to_pil(img_tensor, batch_index=0):
     return Image.fromarray((255 * safe_tensor.cpu().numpy()).astype(np.uint8))
 
 
-def tensor_to_frame(img_tensor, batch_index=0, precision="8-bit"):
-    validate_precision(precision)
-    if precision == "8-bit":
-        return tensor_to_pil(img_tensor, batch_index)
-    pixels = img_tensor[batch_index].detach().to(device="cpu", dtype=torch.float32).numpy()
-    pixels = np.nan_to_num(pixels).clip(0, 1)
-    return RGB16Frame(np.rint(pixels * 65535).astype(np.uint16))
-
-
 def pil_to_tensor(image):
     # Takes a PIL image and returns a tensor of shape [1, height, width, channels]
-    scale = 65535.0 if isinstance(image, RGB16Frame) else 255.0
-    image = frame_pixels(image).astype(np.float32) / scale
+    image = np.asarray(image).astype(np.float32) / 255.0
     image = torch.from_numpy(image).unsqueeze(0)
     if len(image.shape) == 3:  # If the image is grayscale, add a channel dimension
         image = image.unsqueeze(-1)
@@ -76,10 +66,10 @@ class CroppedImages:
         if tile.size != self.size:
             tile = tile.resize(self.size, Image.Resampling.LANCZOS)
         if tile.size != self.padded_size:
-            pixels = frame_pixels(tile)
+            pixels = np.asarray(tile)
             padding = ((0, self.padded_size[1] - tile.height),
                        (0, self.padded_size[0] - tile.width), (0, 0))
-            tile = frame_from_pixels(np.pad(pixels, padding, mode="edge"))
+            tile = Image.fromarray(np.pad(pixels, padding, mode="edge"))
         return tile
 
 

@@ -4,7 +4,6 @@ COMFYUI_ROOT=/path/to/ComfyUI python -B test/h3_unit_test.py
 """
 import contextlib
 import io as stdio
-from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -90,16 +89,9 @@ class H3Tests(unittest.TestCase):
                     self.run_node(guider=guider, batch_size=2)
             self.fixture.assert_clean()
 
-    def test_legacy_defaults_and_explicit_audio_lock(self):
+    def test_legacy_defaults_leave_sampling_unmasked(self):
         calls, _ = self.run_node()
         self.assertTrue(all(mask is None for _, _, mask in calls))
-        calls, _ = self.run_node(h3_audio_lock=True)
-        for guider, _, mask in calls:
-            video, audio = mask.unbind()
-            self.assertTrue(torch.all(video == 1))
-            self.assertTrue(torch.all(audio == 0))
-            self.assertIsNot(guider, self.guider)
-            self.assertIsNot(guider.model_patcher, self.guider.model_patcher)
         self.assertEqual(self.guider.model_options, {'transformer_options': {}})
         self.assertEqual(self.guider.model_patcher.wrappers, {})
 
@@ -127,24 +119,22 @@ class H3Tests(unittest.TestCase):
         self.assertTrue(all(mask is not None for _, _, mask in calls))
         self.assertTrue(any(torch.any(mask.unbind()[0] == 0) for _, _, mask in calls))
 
-    def test_canvas_precision_preserves_h3_shapes_and_masked_source(self):
+    def test_storage_preserves_h3_shapes_and_masked_source(self):
         original = torch.cat([frame for frame, _ in env.io.frames(self.fixture.source)])
         region = torch.zeros(5, 64, 128)
         region[:, 16:48, 32:64] = 1
-        shapes = []
-        for precision in ('8-bit', '16-bit'):
-            expected = original if precision == '16-bit' else (original * 255).to(torch.uint8).float() / 255
-            outputs = []
-            for storage in ('ram', 'disk'):
-                self.vae.encoded.clear()
-                calls, output = self.run_node(mask=region, anchor_context=True, tile_padding=16,
-                                              canvas_precision=precision, canvas_storage=storage)
-                result = torch.cat([frame for frame, _ in env.io.frames(output[1])])
-                self.assertTrue(torch.equal(result[region == 0], expected[region == 0]))
-                outputs.append(result)
-                shapes.append((list(self.vae.encoded), [tuple(mask.unbind()[0].shape) for _, _, mask in calls]))
-            self.assertTrue(torch.equal(*outputs))
-        self.assertTrue(all(shape == shapes[0] for shape in shapes))
+        expected = (original * 255).to(torch.uint8).float() / 255
+        shapes, outputs = [], []
+        for storage in ('ram', 'disk'):
+            self.vae.encoded.clear()
+            calls, output = self.run_node(mask=region, anchor_context=True, tile_padding=16,
+                                          canvas_storage=storage)
+            result = torch.cat([frame for frame, _ in env.io.frames(output[1])])
+            self.assertTrue(torch.equal(result[region == 0], expected[region == 0]))
+            outputs.append(result)
+            shapes.append((list(self.vae.encoded), [tuple(mask.unbind()[0].shape) for _, _, mask in calls]))
+        self.assertTrue(torch.equal(*outputs))
+        self.assertEqual(*shapes)
 
     def test_padding_and_all_seam_modes_preserve_output_geometry(self):
         for overlap in ('Ignore Overlap', 'Reprocess Overlap', 'Context Only Overlap'):
@@ -161,18 +151,6 @@ class H3Tests(unittest.TestCase):
                                         for shape in self.vae.encoded))
                     if overlap == 'Reprocess Overlap' and seams == 'None':
                         self.assertTrue(torch.allclose(frames[0][0], torch.full_like(frames[0][0], 127/255), atol=1/65535, rtol=0))
-
-    def test_seam_sigmas_apply_only_to_seams(self):
-        redraw = torch.tensor([0.5, 0.25, 0.0])
-        seam = torch.tensor([0.15, 0.0])
-        for mode in ('Band Pass', 'Half Tile', 'Half Tile + Intersections'):
-            calls, _ = self.run_node(sigmas=redraw, seam_sigmas=seam,
-                                     seam_fix_width=32, seam_fix_mode=mode)
-            self.assertGreater(len(calls), 2)
-            self.assertTrue(all(torch.equal(s, redraw) for _, s, _ in calls[:2]))
-            self.assertTrue(all(torch.equal(s, seam) for _, s, _ in calls[2:]))
-        calls, _ = self.run_node(sigmas=redraw, seam_fix_mode='Half Tile')
-        self.assertTrue(all(torch.equal(s, redraw) for _, s, _ in calls))
 
     def test_odd_canvas_and_frame_grid_keep_pixels_shape_and_clock(self):
         for count in (5, 21, 22, 23, 39, 175):
@@ -196,29 +174,11 @@ class H3Tests(unittest.TestCase):
                 self.assertIsNotNone(args[-1].get('noise_mask'))
                 raise exception
             with self.assertRaises(type(exception)):
-                self.run_node(h3_audio_lock=True, sample_override=fail)
+                self.run_node(anchor_context=True, tile_overlap_mode='Context Only Overlap',
+                              sample_override=fail)
             self.fixture.assert_clean()
             self.assertEqual(self.guider.model_options, {'transformer_options': {}})
             self.assertEqual(self.guider.model_patcher.wrappers, {})
-
-    def test_seam_schedule_restored_on_cancellation(self):
-        redraw, seam = torch.tensor([0.5, 0.0]), torch.tensor([0.1, 0.0])
-        p = SimpleNamespace(use_guider=True, sigmas=redraw, seam_sigmas=seam)
-        fixer = env.usdu.usdu.USDUSeamsFix()
-        fixer.mode = env.usdu.usdu.USDUSFMode.HALF_TILE
-        def cancel(*args):
-            self.assertIs(p.sigmas, seam)
-            raise KeyboardInterrupt()
-        with patch.object(fixer, 'half_tile_process', side_effect=cancel):
-            with self.assertRaises(KeyboardInterrupt):
-                fixer.start(p, None, 1, 2)
-        self.assertIs(p.sigmas, redraw)
-
-    def test_invalid_seam_schedule_rejected_before_decoding(self):
-        for values in ([], [0.2], [float('nan'), 0], [0.1, 0.2], [-1, 0], [[1, 0]]):
-            with patch.object(env.video.video_io, 'frames', side_effect=AssertionError('decoded source')):
-                with self.assertRaisesRegex(ValueError, 'seam_sigmas'):
-                    self.run_node(seam_sigmas=torch.tensor(values))
 
     def test_h3_temporal_mask_mapping_and_padding(self):
         latent, _ = _empty_av_latent(96, 64, 22)
@@ -227,14 +187,14 @@ class H3Tests(unittest.TestCase):
         frames[4].putpixel((0, 0), 255)
         frames[17].putpixel((32, 0), 255)
         frames[20].putpixel((64, 0), 255)
-        video, audio = h3.build_noise_mask(latent['samples'], lock_audio=True,
+        video, audio = h3.build_noise_mask(latent['samples'],
             masks=frames, source_frames=21, crop_region=(0, 0, 80, 64), tile_size=(80, 64)).unbind()
         self.assertEqual(tuple(video.shape), (1, 24, 7, 4, 6))
         self.assertEqual(torch.nonzero(video[0, 0].flatten(1).any(1)).flatten().tolist(), [1, 5, 6])
         self.assertTrue(torch.all(video[0, :, 1, :2, :2] == 1))
         self.assertTrue(torch.all(video[0, :, 5, :2, 2:4] == 1))
         self.assertTrue(torch.all(video[0, :, 6, :2, 4:6] == 1))
-        self.assertTrue(torch.all(audio == 0))
+        self.assertTrue(torch.all(audio == 1))
 
     def test_core_mask_correction_and_audio_carry(self):
         prepared = h3.prepare_masked_guider(self.guider)
